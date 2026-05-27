@@ -1,0 +1,328 @@
+import type { IncomingMessage, ServerResponse } from "http";
+
+interface SSProxy {
+  name: string;
+  type: "ss";
+  server: string;
+  port: number;
+  cipher: string;
+  password: string;
+  udp: boolean;
+}
+
+interface VMessProxy {
+  name: string;
+  type: "vmess";
+  server: string;
+  port: number;
+  uuid: string;
+  alterId: number;
+  cipher: string;
+  udp: boolean;
+  tls: boolean;
+  network: string;
+  "ws-opts"?: {
+    path: string;
+    headers: { Host: string };
+  };
+  "h2-opts"?: {
+    host: string[];
+    path: string;
+  };
+  "grpc-opts"?: {
+    "grpc-service-name": string;
+  };
+  servername?: string;
+}
+
+type ClashProxy = SSProxy | VMessProxy;
+
+function safeBase64Decode(str: string): string {
+  const cleaned = str.replace(/-/g, "+").replace(/_/g, "/");
+  const padded =
+    cleaned.length % 4 === 0
+      ? cleaned
+      : cleaned + "=".repeat(4 - (cleaned.length % 4));
+  return Buffer.from(padded, "base64").toString("utf-8");
+}
+
+function parseSSUri(uri: string): ClashProxy | null {
+  try {
+    const withoutScheme = uri.replace(/^ss:\/\//, "");
+    const hashIdx = withoutScheme.lastIndexOf("#");
+    const encoded = hashIdx < 0 ? withoutScheme : withoutScheme.slice(0, hashIdx);
+    const rawName = hashIdx < 0 ? "" : withoutScheme.slice(hashIdx + 1);
+    const name = decodeURIComponent(rawName) || "SS Node";
+
+    const decoded = safeBase64Decode(encoded);
+    const atIdx = decoded.lastIndexOf("@");
+
+    if (atIdx < 0) return null;
+
+    const userinfo = decoded.slice(0, atIdx);
+    const hostinfo = decoded.slice(atIdx + 1);
+    const colonIdx = userinfo.indexOf(":");
+    if (colonIdx < 0) return null;
+
+    const cipher = userinfo.slice(0, colonIdx);
+    const password = userinfo.slice(colonIdx + 1);
+
+    const [server, portStr] = hostinfo.split(":");
+    const port = parseInt(portStr, 10);
+
+    return {
+      name,
+      type: "ss",
+      server,
+      port,
+      cipher,
+      password,
+      udp: true,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseVMessUri(uri: string): ClashProxy | null {
+  try {
+    const withoutScheme = uri.replace(/^vmess:\/\//, "");
+    const decoded = safeBase64Decode(withoutScheme);
+    const cfg = JSON.parse(decoded);
+
+    const name = cfg.ps || "VMess Node";
+    const server = cfg.add || "";
+    const port = parseInt(cfg.port, 10) || 0;
+    const uuid = cfg.id || "";
+    const alterId = parseInt(cfg.aid, 10) || 0;
+    const network = cfg.net || "tcp";
+    const tls = cfg.tls === "tls";
+    const host = cfg.host || "";
+    const path = cfg.path || "/";
+    const sni = cfg.sni || "";
+
+    if (!server || !port || !uuid) return null;
+
+    const proxy: VMessProxy = {
+      name,
+      type: "vmess",
+      server,
+      port,
+      uuid,
+      alterId,
+      cipher: "auto",
+      udp: true,
+      tls,
+      network,
+    };
+
+    if (sni) {
+      proxy.servername = sni;
+    }
+
+    if (network === "ws") {
+      proxy["ws-opts"] = {
+        path,
+        headers: { Host: host || server },
+      };
+    } else if (network === "h2" || network === "http") {
+      proxy["h2-opts"] = {
+        host: [host || server],
+        path,
+      };
+    } else if (network === "grpc") {
+      proxy["grpc-opts"] = {
+        "grpc-service-name": path.replace(/\//g, "") || "",
+      };
+    }
+
+    return proxy;
+  } catch {
+    return null;
+  }
+}
+
+function yamlStr(v: string): string {
+  return `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+function buildProxyYaml(p: ClashProxy): string {
+  const lines: string[] = [];
+  lines.push(`  - name: ${yamlStr(p.name)}`);
+  lines.push(`    type: ${p.type}`);
+
+  if (p.type === "ss") {
+    lines.push(`    server: ${p.server}`);
+    lines.push(`    port: ${p.port}`);
+    lines.push(`    cipher: ${p.cipher}`);
+    lines.push(`    password: ${yamlStr(p.password)}`);
+  } else {
+    lines.push(`    server: ${p.server}`);
+    lines.push(`    port: ${p.port}`);
+    lines.push(`    uuid: ${p.uuid}`);
+    lines.push(`    alterId: ${p.alterId}`);
+    lines.push(`    cipher: ${p.cipher}`);
+    if (p.tls) {
+      lines.push(`    tls: true`);
+      if (p.servername) lines.push(`    servername: ${yamlStr(p.servername)}`);
+    }
+    if (p.network !== "tcp") {
+      lines.push(`    network: ${p.network}`);
+    }
+    if (p["ws-opts"]) {
+      lines.push(`    ws-opts:`);
+      lines.push(`      path: ${yamlStr(p["ws-opts"].path)}`);
+      lines.push(`      headers:`);
+      lines.push(`        Host: ${yamlStr(p["ws-opts"].headers.Host)}`);
+    }
+    if (p["h2-opts"]) {
+      lines.push(`    h2-opts:`);
+      lines.push(`      host:`);
+      for (const h of p["h2-opts"].host) {
+        lines.push(`        - ${yamlStr(h)}`);
+      }
+      lines.push(`      path: ${yamlStr(p["h2-opts"].path)}`);
+    }
+    if (p["grpc-opts"]) {
+      lines.push(`    grpc-opts:`);
+      lines.push(`      grpc-service-name: ${yamlStr(p["grpc-opts"]["grpc-service-name"])}`);
+    }
+  }
+  if (p.udp) lines.push(`    udp: true`);
+  return lines.join("\n");
+}
+
+function buildClashConfig(proxies: ClashProxy[]): string {
+  const proxyNames = proxies.map((p) => p.name);
+  const nameList = proxyNames.map((n) => `      - ${yamlStr(n)}`).join("\n");
+
+  const parts: string[] = [];
+  parts.push("mixed-port: 7890");
+  parts.push("allow-lan: false");
+  parts.push("mode: rule");
+  parts.push("log-level: info");
+  parts.push("external-controller: 127.0.0.1:9090");
+  parts.push("proxies:");
+  for (const p of proxies) {
+    parts.push(buildProxyYaml(p));
+  }
+  parts.push("proxy-groups:");
+  parts.push(`  - name: ${yamlStr("Proxy")}`);
+  parts.push("    type: select");
+  parts.push("    proxies:");
+  parts.push(`      - ${yamlStr("Auto")}`);
+  parts.push("      - DIRECT");
+  parts.push(nameList);
+  parts.push(`  - name: ${yamlStr("Auto")}`);
+  parts.push("    type: url-test");
+  parts.push("    proxies:");
+  parts.push(nameList);
+  parts.push("    url: http://www.gstatic.com/generate_204");
+  parts.push("    interval: 300");
+  parts.push("rules:");
+  parts.push("  - DOMAIN-SUFFIX,local,DIRECT");
+  parts.push("  - IP-CIDR,127.0.0.0/8,DIRECT");
+  parts.push("  - IP-CIDR,10.0.0.0/8,DIRECT");
+  parts.push("  - IP-CIDR,172.16.0.0/12,DIRECT");
+  parts.push("  - IP-CIDR,192.168.0.0/16,DIRECT");
+  parts.push(`  - ${yamlStr("GEOIP,CN,DIRECT")}`);
+  parts.push(`  - ${yamlStr("MATCH,Proxy")}`);
+  parts.push("");
+  return parts.join("\n");
+}
+
+export default async function handler(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  try {
+    const url = new URL(req.url || "/", `http://${req.headers.host}`);
+    const service = url.searchParams.get("service");
+    const id = url.searchParams.get("id");
+
+    if (!service || !id) {
+      res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("Missing service or id parameter");
+      return;
+    }
+
+    const jmsUrl = `https://jmssub.net/members/getsub.php?service=${encodeURIComponent(service)}&id=${encodeURIComponent(id)}`;
+
+    const jmsRes = await fetch(jmsUrl, {
+      headers: {
+        "User-Agent": "just-my-clash-socks/1.0",
+      },
+    });
+
+    if (!jmsRes.ok) {
+      res.writeHead(502, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end(`Failed to fetch JMS subscription (${jmsRes.status})`);
+      return;
+    }
+
+    const jmsBody = await jmsRes.text();
+    if (!jmsBody.trim()) {
+      res.writeHead(502, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("JMS subscription content is empty");
+      return;
+    }
+
+    const decodedBody = safeBase64Decode(jmsBody.trim());
+    const lines = decodedBody.split("\n").filter((l) => l.trim());
+
+    if (lines.length === 0) {
+      res.writeHead(502, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("No valid nodes in JMS subscription");
+      return;
+    }
+
+    const proxies: ClashProxy[] = [];
+
+    for (const line of lines) {
+      let parsed: ClashProxy | null = null;
+
+      if (line.startsWith("ss://")) {
+        parsed = parseSSUri(line);
+      } else if (line.startsWith("vmess://")) {
+        parsed = parseVMessUri(line);
+      }
+
+      if (parsed) {
+        proxies.push(parsed);
+      }
+    }
+
+    if (proxies.length === 0) {
+      res.writeHead(502, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("Unable to parse nodes in JMS subscription");
+      return;
+    }
+
+    const yaml = buildClashConfig(proxies);
+    const format = url.searchParams.get("format") || "raw";
+
+    let result: string;
+    let contentType: string;
+
+    if (format === "base64") {
+      result = Buffer.from(yaml, "utf-8").toString("base64");
+      contentType = "text/plain; charset=utf-8";
+    } else if (format === "uri") {
+      result = Buffer.from(decodedBody, "utf-8").toString("base64");
+      contentType = "text/plain; charset=utf-8";
+    } else {
+      result = yaml;
+      contentType = "text/plain; charset=utf-8";
+    }
+
+    res.writeHead(200, {
+      "Content-Type": contentType,
+      "Cache-Control": "max-age=300, s-maxage=300",
+      "subscription-userinfo": "",
+    });
+    res.end(result);
+  } catch (err) {
+    res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end(`Server error: ${err instanceof Error ? err.message : "Unknown error"}`);
+  }
+}

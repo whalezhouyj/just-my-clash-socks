@@ -1,0 +1,15 @@
+{
+  "name": "just-my-clash-socks",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vercel dev",
+    "start": "tsx dev-server.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.22.3",
+    "typescript": "^5.5.0",
+    "vercel": "^37.0.0"
+  }
+}
