@@ -1,4 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "http";
+import https from "https";
+import dns from "dns/promises";
 
 interface SSProxy {
   name: string;
@@ -231,6 +233,81 @@ function buildClashConfig(proxies: ClashProxy[]): string {
   return parts.join("\n");
 }
 
+async function fetchWithPublicDNS(
+  urlStr: string,
+  opts: { headers?: Record<string, string> } = {},
+  redirectCount = 0
+): Promise<{ ok: boolean; status: number; text: () => Promise<string> }> {
+  const MAX_REDIRECTS = 3;
+  const url = new URL(urlStr);
+  const hostname = url.hostname;
+
+  const resolver = new dns.Resolver();
+  resolver.setServers(["1.1.1.1", "8.8.8.8"]);
+  const addresses = await resolver.resolve4(hostname);
+  const ip = addresses[0];
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: ip,
+        port: 443,
+        path: url.pathname + url.search,
+        method: "GET",
+        servername: hostname,
+        headers: {
+          Host: hostname,
+          "User-Agent": "just-my-clash-socks/1.0",
+          ...opts.headers,
+        },
+        timeout: 10000,
+      },
+      async (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk) => chunks.push(chunk));
+        res.on("end", async () => {
+          const body = Buffer.concat(chunks).toString("utf-8");
+          const status = res.statusCode || 500;
+
+          if (
+            [301, 302, 307, 308].includes(status) &&
+            res.headers.location &&
+            redirectCount < MAX_REDIRECTS
+          ) {
+            try {
+              const redirectUrl = new URL(
+                res.headers.location,
+                urlStr
+              ).toString();
+              const redirected = await fetchWithPublicDNS(
+                redirectUrl,
+                opts,
+                redirectCount + 1
+              );
+              resolve(redirected);
+            } catch (err) {
+              reject(err);
+            }
+            return;
+          }
+
+          resolve({
+            ok: status >= 200 && status < 400,
+            status,
+            text: () => Promise.resolve(body),
+          });
+        });
+      }
+    );
+    req.on("error", reject);
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("JMS request timeout"));
+    });
+    req.end();
+  });
+}
+
 export default async function handler(
   req: IncomingMessage,
   res: ServerResponse
@@ -248,11 +325,7 @@ export default async function handler(
 
     const jmsUrl = `https://jmssub.net/members/getsub.php?service=${encodeURIComponent(service)}&id=${encodeURIComponent(id)}`;
 
-    const jmsRes = await fetch(jmsUrl, {
-      headers: {
-        "User-Agent": "just-my-clash-socks/1.0",
-      },
-    });
+    const jmsRes = await fetchWithPublicDNS(jmsUrl);
 
     if (!jmsRes.ok) {
       res.writeHead(502, { "Content-Type": "text/plain; charset=utf-8" });
