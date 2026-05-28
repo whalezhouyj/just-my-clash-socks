@@ -39,6 +39,18 @@ interface VMessProxy {
 
 type ClashProxy = SSProxy | VMessProxy;
 
+const RULES_BY_ID_ENV = "JMS_CLASH_RULES_BY_ID";
+
+const DEFAULT_RULES = [
+  "DOMAIN-SUFFIX,local,DIRECT",
+  "IP-CIDR,127.0.0.0/8,DIRECT",
+  "IP-CIDR,10.0.0.0/8,DIRECT",
+  "IP-CIDR,172.16.0.0/12,DIRECT",
+  "IP-CIDR,192.168.0.0/16,DIRECT",
+  "GEOIP,CN,DIRECT",
+  "MATCH,Proxy",
+];
+
 function safeBase64Decode(str: string): string {
   const cleaned = str.replace(/-/g, "+").replace(/_/g, "/");
   const padded =
@@ -148,6 +160,46 @@ function yamlStr(v: string): string {
   return `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function getRulesForSubscriptionId(id: string): string[] {
+  const rawRulesById = process.env[RULES_BY_ID_ENV];
+
+  // 没有配置私有规则时保持默认配置，方便本地开发和未定制订阅继续工作。
+  if (!rawRulesById) {
+    return DEFAULT_RULES;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawRulesById);
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      throw new Error(`${RULES_BY_ID_ENV} must be valid JSON`);
+    }
+    throw err;
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`${RULES_BY_ID_ENV} must be a JSON object keyed by subscription id`);
+  }
+
+  const rules = (parsed as Record<string, unknown>)[id];
+
+  // 只对命中的订阅 id 使用扩展规则，避免一个人的私有策略影响其它订阅。
+  if (rules === undefined) {
+    return DEFAULT_RULES;
+  }
+
+  if (!isStringArray(rules)) {
+    throw new Error(`${RULES_BY_ID_ENV}.${id} must be an array of Clash rule strings`);
+  }
+
+  return rules;
+}
+
 function buildProxyYaml(p: ClashProxy): string {
   const lines: string[] = [];
   lines.push(`  - name: ${yamlStr(p.name)}`);
@@ -194,7 +246,7 @@ function buildProxyYaml(p: ClashProxy): string {
   return lines.join("\n");
 }
 
-function buildClashConfig(proxies: ClashProxy[]): string {
+function buildClashConfig(proxies: ClashProxy[], rules: string[]): string {
   const proxyNames = proxies.map((p) => p.name);
   const nameList = proxyNames.map((n) => `      - ${yamlStr(n)}`).join("\n");
 
@@ -222,13 +274,9 @@ function buildClashConfig(proxies: ClashProxy[]): string {
   parts.push("    url: http://www.gstatic.com/generate_204");
   parts.push("    interval: 300");
   parts.push("rules:");
-  parts.push("  - DOMAIN-SUFFIX,local,DIRECT");
-  parts.push("  - IP-CIDR,127.0.0.0/8,DIRECT");
-  parts.push("  - IP-CIDR,10.0.0.0/8,DIRECT");
-  parts.push("  - IP-CIDR,172.16.0.0/12,DIRECT");
-  parts.push("  - IP-CIDR,192.168.0.0/16,DIRECT");
-  parts.push(`  - ${yamlStr("GEOIP,CN,DIRECT")}`);
-  parts.push(`  - ${yamlStr("MATCH,Proxy")}`);
+  for (const rule of rules) {
+    parts.push(`  - ${yamlStr(rule)}`);
+  }
   parts.push("");
   return parts.join("\n");
 }
@@ -371,20 +419,24 @@ export default async function handler(
       return;
     }
 
-    const yaml = buildClashConfig(proxies);
     const format = url.searchParams.get("format") || "raw";
 
     let result: string;
     let contentType: string;
 
-    if (format === "base64") {
-      result = Buffer.from(yaml, "utf-8").toString("base64");
-      contentType = "text/plain; charset=utf-8";
-    } else if (format === "uri") {
+    if (format === "uri") {
+      // URI 模式只返回原始节点订阅，不读取 Clash 规则扩展，避免无关 env 配置影响节点导出。
       result = Buffer.from(decodedBody, "utf-8").toString("base64");
       contentType = "text/plain; charset=utf-8";
     } else {
-      result = yaml;
+      const rules = getRulesForSubscriptionId(id);
+      const yaml = buildClashConfig(proxies, rules);
+
+      if (format === "base64") {
+        result = Buffer.from(yaml, "utf-8").toString("base64");
+      } else {
+        result = yaml;
+      }
       contentType = "text/plain; charset=utf-8";
     }
 
